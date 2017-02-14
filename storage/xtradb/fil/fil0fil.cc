@@ -159,6 +159,9 @@ UNIV_INTERN mysql_pfs_key_t	fil_space_latch_key;
 initialized. */
 fil_system_t*	fil_system	= NULL;
 
+/** At this age or older a space/page will be rotated */
+extern uint srv_fil_crypt_rotate_key_age;
+
 /** Determine if (i) is a user tablespace id or not. */
 # define fil_is_user_tablespace_id(i) ((i) > srv_undo_tablespaces_open)
 
@@ -1441,17 +1444,24 @@ fil_space_contains_node(
 /*******************************************************************//**
 Creates a space memory object and puts it to the 'fil system' hash table.
 If there is an error, prints an error message to the .err log.
+@param[in]	name		Space name
+@param[in]	id		Space id
+@param[in]	flags		Tablespace flags
+@param[in]	purpose		FIL_TABLESPACE or FIL_LOG if log
+@param[in]	crypt_data	Encryption information
+@param[in]	create_table	True if this is create table
+@param[in]	mode		Encryption mode
 @return	TRUE if success */
 UNIV_INTERN
-ibool
+bool
 fil_space_create(
-/*=============*/
-	const char*	name,	/*!< in: space name */
-	ulint		id,	/*!< in: space id */
-	ulint		flags,	/*!< in: tablespace flags */
-	ulint		purpose,/*!< in: FIL_TABLESPACE, or FIL_LOG if log */
-	fil_space_crypt_t* crypt_data, /*!< in: crypt data */
-	bool		create_table) /*!< in: true if create table */
+	const char*		name,
+	ulint			id,
+	ulint			flags,
+	ulint			purpose,
+	fil_space_crypt_t*	crypt_data,
+	bool			create_table,
+	fil_encryption_t	mode)
 {
 	fil_space_t*	space;
 
@@ -1475,7 +1485,7 @@ fil_space_create(
 
 				mutex_exit(&fil_system->mutex);
 
-				return(FALSE);
+				return(false);
 			}
 
 			ib_logf(IB_LOG_LEVEL_WARN,
@@ -1502,7 +1512,7 @@ fil_space_create(
 
 		mutex_exit(&fil_system->mutex);
 
-		return(FALSE);
+		return(false);
 	}
 
 	space = static_cast<fil_space_t*>(mem_zalloc(sizeof(*space)));
@@ -1543,8 +1553,9 @@ fil_space_create(
 		    ut_fold_string(name), space);
 	space->is_in_unflushed_spaces = false;
 
-	space->is_corrupt = FALSE;
+	space->is_corrupt = false;
 	space->crypt_data = crypt_data;
+	space->is_in_rotation_list = false;
 
 	/* In create table we write page 0 so we have already
 	"read" it and for system tablespaces we have read
@@ -1564,9 +1575,21 @@ fil_space_create(
 
 	UT_LIST_ADD_LAST(space_list, fil_system->space_list, space);
 
+	/* Inform key rotation that there could be something
+	to do */
+	if (purpose == FIL_TABLESPACE && !srv_fil_crypt_rotate_key_age && fil_crypt_threads_event &&
+	    (mode == FIL_SPACE_ENCRYPTION_ON || mode == FIL_SPACE_ENCRYPTION_OFF ||
+		    srv_encrypt_tables)) {
+		/* Key rotation is not enabled, need to inform background
+		encryption threads. */
+		UT_LIST_ADD_LAST(rotation_list, fil_system->rotation_list, space);
+		space->is_in_rotation_list = true;
+		os_event_set(fil_crypt_threads_event);
+	}
+
 	mutex_exit(&fil_system->mutex);
 
-	return(TRUE);
+	return(true);
 }
 
 /*******************************************************************//**
@@ -1676,6 +1699,11 @@ fil_space_free(
 
 		UT_LIST_REMOVE(unflushed_spaces, fil_system->unflushed_spaces,
 			       space);
+	}
+
+	if (space->is_in_rotation_list) {
+		space->is_in_rotation_list = false;
+		UT_LIST_REMOVE(rotation_list, fil_system->rotation_list, space);
 	}
 
 	UT_LIST_REMOVE(space_list, fil_system->space_list, space);
@@ -3928,7 +3956,7 @@ fil_create_new_single_table_tablespace(
 	}
 
 	success = fil_space_create(tablename, space_id, flags, FIL_TABLESPACE,
-				   crypt_data, true);
+				   crypt_data, true, mode);
 
 	if (!success || !fil_node_create(path, size, space_id, FALSE)) {
 		err = DB_ERROR;
@@ -7191,7 +7219,7 @@ fil_space_set_corrupt(
 	space = fil_space_get_by_id(space_id);
 
 	if (space) {
-		space->is_corrupt = TRUE;
+		space->is_corrupt = true;
 	}
 
 	mutex_exit(&fil_system->mutex);
@@ -7248,36 +7276,6 @@ fil_get_first_space()
 }
 
 /******************************************************************
-Get id of first tablespace that has node or ULINT_UNDEFINED if none */
-UNIV_INTERN
-ulint
-fil_get_first_space_safe()
-/*======================*/
-{
-	ulint out_id = ULINT_UNDEFINED;
-	fil_space_t* space;
-
-	mutex_enter(&fil_system->mutex);
-
-	space = UT_LIST_GET_FIRST(fil_system->space_list);
-	if (space != NULL) {
-		do
-		{
-			if (!space->stop_new_ops && UT_LIST_GET_LEN(space->chain) > 0) {
-				out_id = space->id;
-				break;
-			}
-
-			space = UT_LIST_GET_NEXT(space_list, space);
-		} while (space != NULL);
-	}
-
-	mutex_exit(&fil_system->mutex);
-
-	return out_id;
-}
-
-/******************************************************************
 Get id of next tablespace or ULINT_UNDEFINED if none */
 UNIV_INTERN
 ulint
@@ -7318,45 +7316,206 @@ fil_get_next_space(
 	return out_id;
 }
 
-/******************************************************************
-Get id of next tablespace that has node or ULINT_UNDEFINED if none */
-UNIV_INTERN
-ulint
-fil_get_next_space_safe(
-/*====================*/
-	ulint	id)	/*!< in: previous space id */
+/** Acquire a tablespace when it could be dropped concurrently.
+Used by background threads that do not necessarily hold proper locks
+for concurrency control.
+@param[in]	id	tablespace ID
+@param[in]	silent	whether to silently ignore missing tablespaces
+@return the tablespace, or NULL if missing or being deleted */
+inline
+fil_space_t*
+fil_space_acquire_low(
+	ulint	id,
+	bool	silent)
 {
-	bool found;
-	fil_space_t* space;
-	ulint out_id = ULINT_UNDEFINED;
+	fil_space_t*	space;
 
 	mutex_enter(&fil_system->mutex);
 
 	space = fil_space_get_by_id(id);
+
 	if (space == NULL) {
-		/* we didn't find it...search for space with space->id > id */
-		found = false;
-		space = UT_LIST_GET_FIRST(fil_system->space_list);
+		if (!silent) {
+			ib_logf(IB_LOG_LEVEL_WARN, "Trying to access missing"
+				" tablespace " ULINTPF ".", id);
+		}
+	} else if (space->stop_new_ops) {
+		space = NULL;
 	} else {
-		/* we found it, take next available space */
-		found = true;
+		space->n_pending_ops++;
 	}
 
-	while ((space = UT_LIST_GET_NEXT(space_list, space)) != NULL) {
+	mutex_exit(&fil_system->mutex);
 
-		if (!found && space->id <= id)
-			continue;
+	return(space);
+}
 
-		if (!space->stop_new_ops) {
-			/* inc reference to prevent drop */
-			out_id = space->id;
-			break;
+/** Acquire a tablespace when it could be dropped concurrently.
+Used by background threads that do not necessarily hold proper locks
+for concurrency control.
+@param[in]	id	tablespace ID
+@return the tablespace, or NULL if missing or being deleted */
+fil_space_t*
+fil_space_acquire(
+	ulint	id)
+{
+	return(fil_space_acquire_low(id, false));
+}
+
+/** Acquire a tablespace that may not exist.
+Used by background threads that do not necessarily hold proper locks
+for concurrency control.
+@param[in]	id	tablespace ID
+@return the tablespace, or NULL if missing or being deleted */
+fil_space_t*
+fil_space_acquire_silent(
+	ulint	id)
+{
+	return(fil_space_acquire_low(id, true));
+}
+
+/** Release a tablespace acquired with fil_space_acquire().
+@param[in,out]	space	tablespace to release  */
+void
+fil_space_release(
+	fil_space_t*	space)
+{
+	mutex_enter(&fil_system->mutex);
+	ut_ad(space->magic_n == FIL_SPACE_MAGIC_N);
+	ut_ad(space->n_pending_ops > 0);
+	space->n_pending_ops--;
+	mutex_exit(&fil_system->mutex);
+}
+
+/** Return the next fil_space_t.
+Once started, the caller must keep calling this until it returns NULL.
+fil_space_acquire() and fil_space_release() are invoked here which
+blocks a concurrent operation from dropping the tablespace.
+@param[in]	prev_space	Pointer to the previous fil_space_t.
+If NULL, use the first fil_space_t on fil_system->space_list.
+@return pointer to the next fil_space_t.
+@retval NULL if this was the last*/
+fil_space_t*
+fil_space_next(
+	fil_space_t*	prev_space)
+{
+	fil_space_t*		space=prev_space;
+
+	mutex_enter(&fil_system->mutex);
+
+	if (prev_space == NULL) {
+		space = UT_LIST_GET_FIRST(fil_system->space_list);
+
+		/* We can trust that space is not NULL because at least the
+		system tablespace is always present and loaded first. */
+		space->n_pending_ops++;
+	} else {
+		ut_ad(space->n_pending_ops > 0);
+
+		/* Move on to the next fil_space_t */
+		space->n_pending_ops--;
+		space = UT_LIST_GET_NEXT(space_list, space);
+
+		/* Skip spaces that are being
+		created by fil_ibd_create(),
+		or dropped. */
+		while (space != NULL
+			&& (UT_LIST_GET_LEN(space->chain) == 0
+				|| space->stop_new_ops)) {
+			space = UT_LIST_GET_NEXT(space_list, space);
+		}
+
+		if (space != NULL) {
+			space->n_pending_ops++;
 		}
 	}
 
 	mutex_exit(&fil_system->mutex);
 
-	return out_id;
+	return(space);
+}
+
+/**
+Remove space from key rotation list if there are no more
+pending operations.
+@param[in]	space		Tablespace */
+static
+void
+fil_space_remove_from_keyrotation(
+	fil_space_t* space)
+{
+	ut_ad(mutex_own(&fil_system->mutex));
+	ut_ad(space);
+
+	if (space->n_pending_ops == 0) {
+		space->is_in_rotation_list = false;
+		UT_LIST_REMOVE(rotation_list, fil_system->rotation_list, space);
+	}
+}
+
+
+/** Return the next fil_space_t from key rotation list.
+Once started, the caller must keep calling this until it returns NULL.
+fil_space_acquire() and fil_space_release() are invoked here which
+blocks a concurrent operation from dropping the tablespace.
+@param[in]	prev_space	Pointer to the previous fil_space_t.
+If NULL, use the first fil_space_t on fil_system->space_list.
+@return pointer to the next fil_space_t.
+@retval NULL if this was the last*/
+fil_space_t*
+fil_space_keyrotate_next(
+	fil_space_t*	prev_space)
+{
+	fil_space_t* space = prev_space;
+	fil_space_t* old   = NULL;
+
+	mutex_enter(&fil_system->mutex);
+
+	if (UT_LIST_GET_LEN(fil_system->rotation_list) == 0) {
+		if (space) {
+			ut_ad(space->n_pending_ops > 0);
+			space->n_pending_ops--;
+			fil_space_remove_from_keyrotation(space);
+		}
+		mutex_exit(&fil_system->mutex);
+		return(NULL);
+	}
+
+	if (prev_space == NULL) {
+		space = UT_LIST_GET_FIRST(fil_system->rotation_list);
+
+		/* We can trust that space is not NULL because we
+		checked list length above */
+	} else {
+		ut_ad(space->n_pending_ops > 0);
+
+		/* Move on to the next fil_space_t */
+		space->n_pending_ops--;
+
+		old = space;
+		space = UT_LIST_GET_NEXT(rotation_list, space);
+
+		fil_space_remove_from_keyrotation(old);
+	}
+
+	/* Skip spaces that are being created by fil_ibd_create(),
+	or dropped. */
+	while (space != NULL
+		&& (UT_LIST_GET_LEN(space->chain) == 0
+			|| space->stop_new_ops)) {
+
+		old = space;
+		space = UT_LIST_GET_NEXT(rotation_list, space);
+		fil_space_remove_from_keyrotation(old);
+	}
+
+	if (space != NULL) {
+		space->n_pending_ops++;
+	}
+
+	mutex_exit(&fil_system->mutex);
+
+	return(space);
 }
 
 /******************************************************************

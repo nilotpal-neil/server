@@ -1084,6 +1084,9 @@ static SHOW_VAR innodb_status_variables[]= {
   {"encryption_rotation_estimated_iops",
   (char*) &export_vars.innodb_encryption_rotation_estimated_iops,
    SHOW_LONG},
+  {"encryption_key_rotation_list_length",
+  (char*)&export_vars.innodb_key_rotation_list_length,
+   SHOW_LONGLONG},
 
   /* scrubing */
   {"scrub_background_page_reorganizations",
@@ -19814,10 +19817,11 @@ static MYSQL_SYSVAR_UINT(encryption_rotate_key_age,
 			 PLUGIN_VAR_RQCMDARG,
 			 "Key rotation - re-encrypt in background "
                          "all pages that were encrypted with a key that "
-                         "many (or more) versions behind",
+                         "many (or more) versions behind. Value 0 indicates "
+			 "that key rotation is disabled.",
 			 NULL,
 			 innodb_encryption_rotate_key_age_update,
-			 srv_fil_crypt_rotate_key_age, 0, UINT_MAX32, 0);
+			 1, 0, UINT_MAX32, 0);
 
 static MYSQL_SYSVAR_UINT(encryption_rotation_iops, srv_n_fil_crypt_iops,
 			 PLUGIN_VAR_RQCMDARG,
@@ -20731,8 +20735,9 @@ innodb_encrypt_tables_validate(
 						for update function */
 	struct st_mysql_value*		value)	/*!< in: incoming string */
 {
-	if (check_sysvar_enum(thd, var, save, value))
+	if (check_sysvar_enum(thd, var, save, value)) {
 		return 1;
+	}
 
 	ulong encrypt_tables = *(ulong*)save;
 
@@ -20744,6 +20749,16 @@ innodb_encrypt_tables_validate(
 		                    "encryption plugin is not available");
 		return 1;
 	}
+
+	if (!srv_fil_crypt_rotate_key_age) {
+		const char *msg = (encrypt_tables ? "enable" : "disable");
+		push_warning_printf(thd, Sql_condition::WARN_LEVEL_WARN,
+				    HA_ERR_UNSUPPORTED,
+				    "InnoDB: cannot %s encryption, "
+				    "innodb_encryption_rotate_key_age=0 i.e. key rotation disabled", msg);
+		return 1;
+	}
+
 	return 0;
 }
 

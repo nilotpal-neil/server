@@ -1,7 +1,7 @@
 /*****************************************************************************
 
 Copyright (c) 1996, 2016, Oracle and/or its affiliates. All Rights Reserved.
-Copyright (c) 2014, 2015, MariaDB Corporation
+Copyright (c) 2014, 2017, MariaDB Corporation
 
 This program is free software; you can redistribute it and/or modify it under
 the terms of the GNU General Public License as published by the Free Software
@@ -6445,8 +6445,8 @@ loop:
 
 	if (lock_get_type_low(lock) == LOCK_REC) {
 		if (load_page_first) {
-			ulint	space	= lock->un_member.rec_lock.space;
-			ulint	zip_size= fil_space_get_zip_size(space);
+			ulint	space_id = lock->un_member.rec_lock.space;
+			ulint	zip_size= fil_space_get_zip_size(space_id);
 			ulint	page_no = lock->un_member.rec_lock.page_no;
 			ibool	tablespace_being_deleted = FALSE;
 
@@ -6460,7 +6460,7 @@ loop:
 
 				fprintf(file, "RECORD LOCKS on"
 					" non-existing space %lu\n",
-					(ulong) space);
+					(ulong) space_id);
 				goto print_rec;
 			}
 
@@ -6473,13 +6473,12 @@ loop:
 
 				/* Check if the space is exists or not. only
                                 when the space is valid, try to get the page. */
-				tablespace_being_deleted
-					= fil_inc_pending_ops(space, false);
+				fil_space_t* space = fil_space_acquire_silent(space_id);
 
-				if (!tablespace_being_deleted) {
+				if (space) {
 					mtr_start(&mtr);
 
-					buf_page_get_gen(space, zip_size,
+					buf_page_get_gen(space_id, zip_size,
 							 page_no, RW_NO_LATCH,
 							 NULL,
 							 BUF_GET_POSSIBLY_FREED,
@@ -6488,11 +6487,11 @@ loop:
 
 					mtr_commit(&mtr);
 
-					fil_decr_pending_ops(space);
+					fil_space_release(space);
 				} else {
 					fprintf(file, "RECORD LOCKS on"
 						" non-existing space %lu\n",
-						(ulong) space);
+						(ulong) space_id);
 				}
 			}
 
@@ -6924,7 +6923,7 @@ static
 void
 lock_rec_block_validate(
 /*====================*/
-	ulint		space,
+	ulint		space_id,
 	ulint		page_no)
 {
 	/* The lock and the block that it is referring to may be freed at
@@ -6937,10 +6936,12 @@ lock_rec_block_validate(
 
 	/* Make sure that the tablespace is not deleted while we are
 	trying to access the page. */
-	if (!fil_inc_pending_ops(space, true)) {
+	fil_space_t* space = fil_space_acquire_silent(space_id);
+
+	if (space) {
 		mtr_start(&mtr);
 		block = buf_page_get_gen(
-			space, fil_space_get_zip_size(space),
+			space_id, fsp_flags_get_zip_size(space->flags),
 			page_no, RW_X_LATCH, NULL,
 			BUF_GET_POSSIBLY_FREED,
 			__FILE__, __LINE__, &mtr);
@@ -6950,7 +6951,7 @@ lock_rec_block_validate(
 		ut_ad(lock_rec_validate_page(block));
 		mtr_commit(&mtr);
 
-		fil_decr_pending_ops(space);
+		fil_space_release(space);
 	}
 }
 

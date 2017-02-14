@@ -694,7 +694,8 @@ create_log_files(
 		logfilename, SRV_LOG_SPACE_FIRST_ID, 0,
 		FIL_LOG,
 		NULL /* no encryption yet */,
-		true /* this is create */);
+		true /* this is create */,
+		(fil_encryption_t)FIL_SPACE_ENCRYPTION_DEFAULT);
 	ut_a(fil_validate());
 
 	logfile0 = fil_node_create(
@@ -716,7 +717,8 @@ create_log_files(
 #ifdef UNIV_LOG_ARCHIVE
 	/* Create the file space object for archived logs. */
 	fil_space_create("arch_log_space", SRV_LOG_SPACE_FIRST_ID + 1,
-		0, FIL_LOG, NULL /* no encryption yet */, true /* create */);
+		0, FIL_LOG, NULL /* no encryption yet */, true /* create */,
+		(fil_encryption_t)FIL_SPACE_ENCRYPTION_DEFAULT);
 #endif
 	log_group_init(0, srv_n_log_files,
 		       srv_log_file_size * UNIV_PAGE_SIZE,
@@ -1194,7 +1196,8 @@ check_first_page:
 			flags = FSP_FLAGS_PAGE_SSIZE();
 
 			fil_space_create(name, 0, flags, FIL_TABLESPACE,
-					crypt_data, (*create_new_db) == true);
+				crypt_data, (*create_new_db) == true,
+				(fil_encryption_t)FIL_SPACE_ENCRYPTION_DEFAULT);
 		}
 
 		ut_a(fil_validate());
@@ -1342,7 +1345,8 @@ srv_undo_tablespace_open(
 		flags = FSP_FLAGS_PAGE_SSIZE();
 		fil_space_create(name, space, flags, FIL_TABLESPACE,
 				NULL /* no encryption */,
-				true /* create */);
+				true /* create */,
+			(fil_encryption_t)FIL_SPACE_ENCRYPTION_DEFAULT);
 
 		ut_a(fil_validate());
 
@@ -2374,7 +2378,8 @@ innobase_start_or_create_for_mysql(void)
 		fil_space_create(logfilename,
 				 SRV_LOG_SPACE_FIRST_ID, 0, FIL_LOG,
 				 NULL /* no encryption yet */,
-				 true /* create */);
+				 true /* create */,
+				 FIL_SPACE_ENCRYPTION_DEFAULT);
 
 		ut_a(fil_validate());
 
@@ -2397,7 +2402,7 @@ innobase_start_or_create_for_mysql(void)
 		MySQL, no archiving ever done. */
 		fil_space_create("arch_log_space", SRV_LOG_SPACE_FIRST_ID + 1,
 			0, FIL_LOG, NULL /* no encryption yet */,
-			true /* create */);
+			true /* create */, FIL_SPACE_ENCRYPTION_DEFAULT);
 #endif /* UNIV_LOG_ARCHIVE */
 		log_group_init(0, i, srv_log_file_size * UNIV_PAGE_SIZE,
 			       SRV_LOG_SPACE_FIRST_ID,

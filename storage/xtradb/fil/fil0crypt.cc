@@ -37,7 +37,6 @@ Modified           Jan Lindström jan.lindstrom@mariadb.com
 #include "fsp0fsp.h"
 #include "fil0pagecompress.h"
 #include "ha_prototypes.h" // IB_LOG_
-
 #include <my_crypt.h>
 
 /** Mutex for keys */
@@ -59,7 +58,7 @@ UNIV_INTERN uint srv_n_fil_crypt_threads = 0;
 UNIV_INTERN uint srv_n_fil_crypt_threads_started = 0;
 
 /** At this age or older a space/page will be rotated */
-UNIV_INTERN uint srv_fil_crypt_rotate_key_age = 1;
+UNIV_INTERN uint srv_fil_crypt_rotate_key_age;
 
 /** Event to signal FROM the key rotation threads. */
 static os_event_t fil_crypt_event;
@@ -104,6 +103,10 @@ static mysql_pfs_key_t fil_crypt_stat_mutex_key;
 UNIV_INTERN mysql_pfs_key_t fil_crypt_data_mutex_key;
 #endif
 
+/** Is background scrubbing enabled, defined on btr0scrub.cc */
+extern my_bool srv_background_scrub_data_uncompressed;
+extern my_bool srv_background_scrub_data_compressed;
+
 static bool
 fil_crypt_needs_rotation(
 /*=====================*/
@@ -127,6 +130,7 @@ fil_space_crypt_init()
 
 	mutex_create(fil_crypt_stat_mutex_key,
 		     &crypt_stat_mutex, SYNC_NO_ORDER_CHECK);
+
 	memset(&crypt_stat, 0, sizeof(crypt_stat));
 }
 
@@ -701,12 +705,12 @@ fil_space_encrypt(
 		bool different = memcmp(src, tmp_mem, size);
 
 		if (!ok || corrupted || corrupted1 || err != DB_SUCCESS || different) {
-			fprintf(stderr, "JAN: ok %d corrupted %d corrupted1 %d err %d different %d\n", ok , corrupted, corrupted1, err, different);
-			fprintf(stderr, "JAN1: src_frame\n");
+			fprintf(stderr, "ok %d corrupted %d corrupted1 %d err %d different %d\n", ok , corrupted, corrupted1, err, different);
+			fprintf(stderr, "src_frame\n");
 			buf_page_print(src_frame, zip_size, BUF_PAGE_PRINT_NO_CRASH);
-			fprintf(stderr, "JAN2: encrypted_frame\n");
+			fprintf(stderr, "encrypted_frame\n");
 			buf_page_print(tmp, zip_size, BUF_PAGE_PRINT_NO_CRASH);
-			fprintf(stderr, "JAN1: decrypted_frame\n");
+			fprintf(stderr, "decrypted_frame\n");
 			buf_page_print(tmp_mem, zip_size, BUF_PAGE_PRINT_NO_CRASH);
 			ut_error;
 		}
@@ -1166,39 +1170,35 @@ fil_crypt_is_closing(
 
 /***********************************************************************
 Start encrypting a space
-@return true if a pending op (fil_inc_pending_ops/fil_decr_pending_ops) is held
+@param[in,out]		space		Tablespace
+@return true if a recheck is needed
 */
 static
 bool
 fil_crypt_start_encrypting_space(
-/*=============================*/
-	ulint	space,	/*!< in: FIL space id */
-	bool*	recheck)/*!< out: true if recheck needed */
+	fil_space_t*	space)
 {
-
-	/* we have a pending op when entering function */
-	bool pending_op = true;
-
+	bool recheck = false;
 	mutex_enter(&fil_crypt_threads_mutex);
 
-	fil_space_crypt_t *crypt_data = fil_space_get_crypt_data(space);
-	ibool page_encrypted = (crypt_data != NULL);
+	fil_space_crypt_t *crypt_data = space->crypt_data;
+	bool page_encrypted = (crypt_data != NULL);
 
-	/*If spage is not encrypted and encryption is not enabled, then
+	/* If space is not encrypted and encryption is not enabled, then
 	do not continue encrypting the space. */
 	if (!page_encrypted && !srv_encrypt_tables) {
 		mutex_exit(&fil_crypt_threads_mutex);
-		return pending_op;
+		return recheck;
 	}
 
 	if (crypt_data != NULL || fil_crypt_start_converting) {
 		/* someone beat us to it */
 		if (fil_crypt_start_converting) {
-			*recheck = true;
+			recheck = true;
 		}
 
 		mutex_exit(&fil_crypt_threads_mutex);
-		return pending_op;
+		return recheck;
 	}
 
 	/* NOTE: we need to write and flush page 0 before publishing
@@ -1208,9 +1208,10 @@ fil_crypt_start_encrypting_space(
 
 	/* 1 - create crypt data */
 	crypt_data = fil_space_create_crypt_data(FIL_SPACE_ENCRYPTION_DEFAULT, FIL_DEFAULT_ENCRYPTION_KEY);
+
 	if (crypt_data == NULL) {
 		mutex_exit(&fil_crypt_threads_mutex);
-		return pending_op;
+		return recheck;
 	}
 
 	crypt_data->type = CRYPT_SCHEME_UNENCRYPTED;
@@ -1220,7 +1221,7 @@ fil_crypt_start_encrypting_space(
 	crypt_data->rotate_state.active_threads = 1;
 
 	mutex_enter(&crypt_data->mutex);
-	crypt_data = fil_space_set_crypt_data(space, crypt_data);
+	crypt_data = fil_space_set_crypt_data(space->id, crypt_data);
 	mutex_exit(&crypt_data->mutex);
 
 	fil_crypt_start_converting = true;
@@ -1228,34 +1229,23 @@ fil_crypt_start_encrypting_space(
 
 	do
 	{
-		if (fil_crypt_is_closing(space) ||
-			fil_space_found_by_id(space) == NULL) {
-			break;
-		}
-
 		mtr_t mtr;
 		mtr_start(&mtr);
 
 		/* 2 - get page 0 */
 		ulint offset = 0;
-		ulint zip_size = fil_space_get_zip_size(space);
-		buf_block_t* block = buf_page_get_gen(space, zip_size, offset,
+		ulint zip_size = fil_space_get_zip_size(space->id);
+		buf_block_t* block = buf_page_get_gen(space->id, zip_size, offset,
 						      RW_X_LATCH,
 						      NULL,
 						      BUF_GET,
 						      __FILE__, __LINE__,
 						      &mtr);
 
-		if (fil_crypt_is_closing(space) ||
-		    fil_space_found_by_id(space) == NULL) {
-			mtr_commit(&mtr);
-			break;
-		}
-
 		/* 3 - compute location to store crypt data */
 		byte* frame = buf_block_get_frame(block);
-		ulint maxsize;
-		ut_ad(crypt_data);
+		ulint maxsize=0;
+
 		crypt_data->page0_offset =
 			fsp_header_get_crypt_offset(zip_size, &maxsize);
 
@@ -1268,47 +1258,24 @@ fil_crypt_start_encrypting_space(
 
 		mtr_commit(&mtr);
 
-		if (fil_crypt_is_closing(space) ||
-		    fil_space_found_by_id(space) == NULL) {
-			break;
-		}
-
 		/* record lsn of update */
 		lsn_t end_lsn = mtr.end_lsn;
 
 		/* 4 - sync tablespace before publishing crypt data */
 
-		/* release "lock" while syncing */
-		fil_decr_pending_ops(space);
-		pending_op = false;
-
 		bool success = false;
 		ulint n_pages = 0;
 		ulint sum_pages = 0;
+
 		do {
 			success = buf_flush_list(ULINT_MAX, end_lsn, &n_pages);
 			buf_flush_wait_batch_end(NULL, BUF_FLUSH_LIST);
 			sum_pages += n_pages;
 		} while (!success &&
-			 !fil_crypt_is_closing(space) &&
-			 !fil_space_found_by_id(space));
-
-		/* try to reacquire pending op */
-		if (fil_inc_pending_ops(space, true)) {
-			break;
-		}
-
-		/* pending op reacquired! */
-		pending_op = true;
-
-		if (fil_crypt_is_closing(space) ||
-		    fil_space_found_by_id(space) == NULL) {
-			break;
-		}
+			 !fil_crypt_is_closing(space->id));
 
 		/* 5 - publish crypt data */
 		mutex_enter(&fil_crypt_threads_mutex);
-		ut_ad(crypt_data);
 		mutex_enter(&crypt_data->mutex);
 		crypt_data->type = CRYPT_SCHEME_1;
 		ut_a(crypt_data->rotate_state.active_threads == 1);
@@ -1319,10 +1286,9 @@ fil_crypt_start_encrypting_space(
 		mutex_exit(&crypt_data->mutex);
 		mutex_exit(&fil_crypt_threads_mutex);
 
-		return pending_op;
+		return recheck;
 	} while (0);
 
-	ut_ad(crypt_data);
 	mutex_enter(&crypt_data->mutex);
 	ut_a(crypt_data->rotate_state.active_threads == 1);
 	crypt_data->rotate_state.active_threads = 0;
@@ -1332,7 +1298,7 @@ fil_crypt_start_encrypting_space(
 	fil_crypt_start_converting = false;
 	mutex_exit(&fil_crypt_threads_mutex);
 
-	return pending_op;
+	return recheck;
 }
 
 /** State of a rotation thread */
@@ -1346,7 +1312,7 @@ struct rotate_thread_t {
 
 	uint thread_no;
 	bool first;		    /*!< is position before first space */
-	ulint space;		    /*!< current space */
+	fil_space_t* space;	    /*!< current space or NULL */
 	ulint offset;		    /*!< current offset */
 	ulint batch;		    /*!< #pages to rotate */
 	uint  min_key_version_found;/*!< min key version found but not rotated */
@@ -1390,45 +1356,28 @@ fil_crypt_space_needs_rotation(
 	key_state_t*		key_state,	/*!< in: Key state */
 	bool*			recheck)	/*!< out: needs recheck ? */
 {
-	ulint space = state->space;
+	fil_space_t* space = state->space;
 
-	/* Make sure that tablespace is found and it is normal tablespace */
-	if (fil_space_found_by_id(space) == NULL ||
-		fil_space_get_type(space) != FIL_TABLESPACE) {
+	/* Make sure that tablespace is normal tablespace */
+	if (space->purpose != FIL_TABLESPACE) {
 		return false;
 	}
 
-	if (fil_inc_pending_ops(space, true)) {
-		/* tablespace being dropped */
-		return false;
-	}
-
-	/* keep track of if we have pending op */
-	bool pending_op = true;
-
-	fil_space_crypt_t *crypt_data = fil_space_get_crypt_data(space);
+	fil_space_crypt_t *crypt_data = space->crypt_data;
 
 	if (crypt_data == NULL) {
 		/**
 		* space has no crypt data
 		*   start encrypting it...
 		*/
-		pending_op = fil_crypt_start_encrypting_space(space, recheck);
-
-		crypt_data = fil_space_get_crypt_data(space);
+		*recheck = fil_crypt_start_encrypting_space(space);
+		crypt_data = space->crypt_data;
 
 		if (crypt_data == NULL) {
-			if (pending_op) {
-				fil_decr_pending_ops(space);
-			}
 			return false;
 		}
 
 		crypt_data->key_get_latest_version();
-
-		if (!crypt_data->is_key_found()) {
-			return false;
-		}
 	}
 
 	/* If used key_id is not found from encryption plugin we can't
@@ -1472,12 +1421,14 @@ fil_crypt_space_needs_rotation(
 			key_state->key_version, key_state->rotate_key_age);
 
 		crypt_data->rotate_state.scrubbing.is_active =
-			btr_scrub_start_space(space, &state->scrub_data);
+			btr_scrub_start_space(space->id, &state->scrub_data);
 
 		time_t diff = time(0) - crypt_data->rotate_state.scrubbing.
 			last_scrub_completed;
 
 		bool need_scrubbing =
+			(srv_background_scrub_data_uncompressed ||
+			 srv_background_scrub_data_compressed) &&
 			crypt_data->rotate_state.scrubbing.is_active
 			&& diff >= srv_background_scrub_data_interval;
 
@@ -1486,15 +1437,12 @@ fil_crypt_space_needs_rotation(
 		}
 
 		mutex_exit(&crypt_data->mutex);
-		/* NOTE! fil_decr_pending_ops is performed outside */
+
 		return true;
 	} while (0);
 
 	mutex_exit(&crypt_data->mutex);
 
-	if (pending_op) {
-		fil_decr_pending_ops(space);
-	}
 
 	return false;
 }
@@ -1700,30 +1648,41 @@ fil_crypt_find_space_to_rotate(
 	}
 
 	if (state->should_shutdown()) {
+		if (state->space) {
+			fil_space_release(state->space);
+			state->space = NULL;
+		}
 		return false;
 	}
 
 	if (state->first) {
 		state->first = false;
-		state->space = fil_get_first_space_safe();
-	} else {
-		state->space = fil_get_next_space_safe(state->space);
+		state->space = NULL;
 	}
 
-	while (!state->should_shutdown() && state->space != ULINT_UNDEFINED) {
-		fil_space_t* space = fil_space_found_by_id(state->space);
+	/* If key rotation is enabled (default) we iterate all tablespaces.
+	If key rotation is not enabled we iterate only the tablespaces
+	added to keyrotation list. */
+	if (srv_fil_crypt_rotate_key_age) {
+		state->space = fil_space_next(state->space);
+	} else {
+		state->space = fil_space_keyrotate_next(state->space);
+	}
 
-		if (space) {
-			if (fil_crypt_space_needs_rotation(state, key_state, recheck)) {
-				ut_ad(key_state->key_id);
-				/* init state->min_key_version_found before
-				* starting on a space */
-				state->min_key_version_found = key_state->key_version;
-				return true;
-			}
+	while (!state->should_shutdown() && state->space) {
+		if (fil_crypt_space_needs_rotation(state, key_state, recheck)) {
+			ut_ad(key_state->key_id);
+			/* init state->min_key_version_found before
+			* starting on a space */
+			state->min_key_version_found = key_state->key_version;
+			return true;
 		}
 
-		state->space = fil_get_next_space_safe(state->space);
+		if (srv_fil_crypt_rotate_key_age) {
+			state->space = fil_space_next(state->space);
+		} else {
+			state->space = fil_space_keyrotate_next(state->space);
+		}
 	}
 
 	/* if we didn't find any space return iops */
@@ -1742,8 +1701,8 @@ fil_crypt_start_rotate_space(
 	const key_state_t*	key_state,	/*!< in: Key state */
 	rotate_thread_t*	state)		/*!< in: Key rotation state */
 {
-	ulint space = state->space;
-	fil_space_crypt_t *crypt_data = fil_space_get_crypt_data(space);
+	ulint space_id = state->space->id;
+	fil_space_crypt_t *crypt_data = state->space->crypt_data;
 
 	ut_ad(crypt_data);
 	mutex_enter(&crypt_data->mutex);
@@ -1754,7 +1713,7 @@ fil_crypt_start_rotate_space(
 		crypt_data->rotate_state.next_offset = 1; // skip page 0
 		/* no need to rotate beyond current max
 		* if space extends, it will be encrypted with newer version */
-		crypt_data->rotate_state.max_offset = fil_space_get_size(space);
+		crypt_data->rotate_state.max_offset = fil_space_get_size(space_id);
 
 		crypt_data->rotate_state.end_lsn = 0;
 		crypt_data->rotate_state.min_key_version_found =
@@ -1792,8 +1751,7 @@ fil_crypt_find_page_to_rotate(
 	rotate_thread_t*	state)		/*!< in: Key rotation state */
 {
 	ulint batch = srv_alloc_time * state->allocated_iops;
-	ulint space = state->space;
-	fil_space_crypt_t *crypt_data = fil_space_get_crypt_data(space);
+	fil_space_crypt_t *crypt_data = state->space->crypt_data;
 
 	/* Space might already be dropped */
 	if (crypt_data) {
@@ -1997,13 +1955,15 @@ fil_crypt_rotate_page(
 	const key_state_t*	key_state,	/*!< in: Key state */
 	rotate_thread_t*	state)		/*!< in: Key rotation state */
 {
-	ulint space = state->space;
+	fil_space_t*space = state->space;
+	ulint space_id = space->id;
 	ulint offset = state->offset;
-	const uint zip_size = fil_space_get_zip_size(space);
+	const uint zip_size = fil_space_get_zip_size(space_id);
 	ulint sleeptime_ms = 0;
+	fil_space_crypt_t *crypt_data = space->crypt_data;
 
 	/* check if tablespace is closing before reading page */
-	if (fil_crypt_is_closing(space) || fil_space_found_by_id(space) == NULL) {
+	if (space->stop_new_ops) {
 		return;
 	}
 
@@ -2015,7 +1975,7 @@ fil_crypt_rotate_page(
 	mtr_t mtr;
 	mtr_start(&mtr);
 	buf_block_t* block = fil_crypt_get_page_throttle(state,
-							 space, zip_size,
+							 space_id, zip_size,
 							 offset, &mtr,
 							 &sleeptime_ms);
 
@@ -2027,9 +1987,8 @@ fil_crypt_rotate_page(
 		uint kv =  block->page.key_version;
 
 		/* check if tablespace is closing after reading page */
-		if (!fil_crypt_is_closing(space)) {
+		if (space->stop_new_ops) {
 			byte* frame = buf_block_get_frame(block);
-			fil_space_crypt_t *crypt_data = fil_space_get_crypt_data(space);
 
 			if (kv == 0 &&
 				fil_crypt_is_page_uninitialized(frame, zip_size)) {
@@ -2049,7 +2008,7 @@ fil_crypt_rotate_page(
 				/* force rotation by dummy updating page */
 				mlog_write_ulint(frame +
 					FIL_PAGE_ARCH_LOG_NO_OR_SPACE_ID,
-					space, MLOG_4BYTES, &mtr);
+					space_id, MLOG_4BYTES, &mtr);
 
 				/* update block */
 				block->page.key_version = key_state->key_version;
@@ -2082,7 +2041,7 @@ fil_crypt_rotate_page(
 			*/
 			btr_scrub_page_allocation_status_t allocated;
 			block = btr_scrub_get_block_and_allocation_status(
-				state, space, zip_size, offset, &mtr,
+				state, space_id, zip_size, offset, &mtr,
 				&allocated,
 				&sleeptime_ms);
 
@@ -2096,7 +2055,7 @@ fil_crypt_rotate_page(
 					/* we need to refetch it once more now that we have
 					* index locked */
 					block = btr_scrub_get_block_and_allocation_status(
-						state, space, zip_size, offset, &mtr,
+						state, space_id, zip_size, offset, &mtr,
 						&allocated,
 						&sleeptime_ms);
 
@@ -2127,7 +2086,6 @@ fil_crypt_rotate_page(
 		if (needs_scrubbing == BTR_SCRUB_TURNED_OFF) {
 			/* if we just detected that scrubbing was turned off
 			* update global state to reflect this */
-			fil_space_crypt_t *crypt_data = fil_space_get_crypt_data(space);
 			ut_ad(crypt_data);
 			mutex_enter(&crypt_data->mutex);
 			crypt_data->rotate_state.scrubbing.is_active = false;
@@ -2163,7 +2121,7 @@ fil_crypt_rotate_pages(
 	const key_state_t*	key_state,	/*!< in: Key state */
 	rotate_thread_t*	state)		/*!< in: Key rotation state */
 {
-	ulint space = state->space;
+	ulint space = state->space->id;
 	ulint end = state->offset + state->batch;
 
 	for (; state->offset < end; state->offset++) {
@@ -2256,8 +2214,7 @@ fil_crypt_complete_rotate_space(
 	const key_state_t*	key_state,	/*!< in: Key state */
 	rotate_thread_t*	state)		/*!< in: Key rotation state */
 {
-	ulint space = state->space;
-	fil_space_crypt_t *crypt_data = fil_space_get_crypt_data(space);
+	fil_space_crypt_t *crypt_data = state->space->crypt_data;
 
 	/* Space might already be dropped */
 	if (crypt_data != NULL && !crypt_data->is_closing(false)) {
@@ -2318,7 +2275,7 @@ fil_crypt_complete_rotate_space(
 		}
 
 		if (should_flush) {
-			fil_crypt_flush_space(state, space);
+			fil_crypt_flush_space(state, state->space->id);
 
 			ut_ad(crypt_data);
 			mutex_enter(&crypt_data->mutex);
@@ -2364,7 +2321,13 @@ DECLARE_THREAD(fil_crypt_thread)(
 			* i.e either new key version of change or
 			* new rotate_key_age */
 			os_event_reset(fil_crypt_threads_event);
-			if (os_event_wait_time(fil_crypt_threads_event, 1000000) == 0) {
+
+			if(srv_fil_crypt_rotate_key_age) {
+				if (os_event_wait_time(fil_crypt_threads_event, 1000000) == 0) {
+					break;
+				}
+			} else {
+				os_event_wait(fil_crypt_threads_event);
 				break;
 			}
 
@@ -2377,7 +2340,11 @@ DECLARE_THREAD(fil_crypt_thread)(
 
 			time_t waited = time(0) - wait_start;
 
-			if (waited >= srv_background_scrub_data_check_interval) {
+			/* Break if we have waited the background scrub
+			internal and background scrubbing is enabled */
+			if (waited >= srv_background_scrub_data_check_interval
+			    && (srv_background_scrub_data_uncompressed
+			        || srv_background_scrub_data_compressed)) {
 				break;
 			}
 		}
@@ -2391,13 +2358,6 @@ DECLARE_THREAD(fil_crypt_thread)(
 
 			/* we found a space to rotate */
 			fil_crypt_start_rotate_space(&new_state, &thr);
-
-			/* decrement pending ops that was incremented in
-			* fil_crypt_space_needs_rotation
-			* (called from fil_crypt_find_space_to_rotate),
-			* this makes sure that tablespace won't be dropped
-			* just after we decided to start processing it. */
-			fil_decr_pending_ops(thr.space);
 
 			/* iterate all pages (cooperativly with other threads) */
 			while (!thr.should_shutdown() &&
@@ -2423,6 +2383,12 @@ DECLARE_THREAD(fil_crypt_thread)(
 
 	/* return iops if shutting down */
 	fil_crypt_return_iops(&thr);
+
+	/* release current space if shutting down */
+	if (thr.space) {
+		fil_space_release(thr.space);
+		thr.space = NULL;
+	}
 
 	mutex_enter(&fil_crypt_threads_mutex);
 	srv_n_fil_crypt_threads_started--;
