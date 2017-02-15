@@ -1,5 +1,7 @@
 -- source include/have_innodb.inc
 -- source include/have_file_key_management_plugin.inc
+# not embedded because of restarts
+-- source include/not_embedded.inc
 
 SELECT NAME FROM INFORMATION_SCHEMA.INNODB_TABLESPACES_ENCRYPTION WHERE MIN_KEY_VERSION <> 0;
 SELECT NAME FROM INFORMATION_SCHEMA.INNODB_TABLESPACES_ENCRYPTION WHERE MIN_KEY_VERSION = 0;
