@@ -114,15 +114,15 @@ MI_INFO *mi_open(const char *name, int mode, uint open_flags)
                       my_errno= HA_ERR_CRASHED;
                       goto err;
                     });
-    if ((kfile= mysql_file_open(mi_key_file_kfile,
-                                name_buff,
-                                (open_mode= O_RDWR) | O_SHARE, MYF(0))) < 0)
+    if ((kfile= mysql_file_open(mi_key_file_kfile, name_buff,
+                                (open_mode= O_RDWR) | O_SHARE | O_NOFOLLOW,
+                                MYF(0))) < 0)
     {
       if ((errno != EROFS && errno != EACCES) ||
 	  mode != O_RDONLY ||
-          (kfile= mysql_file_open(mi_key_file_kfile,
-                                  name_buff,
-                                  (open_mode= O_RDONLY) | O_SHARE, MYF(0))) < 0)
+          (kfile= mysql_file_open(mi_key_file_kfile, name_buff,
+                                  (open_mode= O_RDONLY) | O_SHARE| O_NOFOLLOW,
+                                  MYF(0))) < 0)
 	goto err;
     }
     share->mode=open_mode;
@@ -1239,6 +1239,7 @@ int mi_open_datafile(MI_INFO *info, MYISAM_SHARE *share, const char *org_name,
 {
   char *data_name= share->data_file_name;
   char real_data_name[FN_REFLEN];
+  int mode= share->mode | O_SHARE;
 
   if (org_name)
   {
@@ -1253,9 +1254,11 @@ int mi_open_datafile(MI_INFO *info, MYISAM_SHARE *share, const char *org_name,
       }
       data_name= real_data_name;
     }
+    mode|= O_NOFOLLOW;
   }
+  DEBUG_SYNC_C("mi_open_datafile");
   info->dfile= mysql_file_open(mi_key_file_dfile,
-                               data_name, share->mode | O_SHARE, MYF(MY_WME));
+                               data_name, mode, MYF(MY_WME));
   return info->dfile >= 0 ? 0 : 1;
 }
 
@@ -1264,7 +1267,7 @@ int mi_open_keyfile(MYISAM_SHARE *share)
 {
   if ((share->kfile= mysql_file_open(mi_key_file_kfile,
                                      share->unique_file_name,
-                                     share->mode | O_SHARE,
+                                     share->mode | O_SHARE | O_NOFOLLOW,
                                      MYF(MY_WME))) < 0)
     return 1;
   return 0;

@@ -1,0 +1,33 @@
+#
+# MDEV-11902 mi_open race condition
+#
+source include/have_debug_sync.inc;
+source include/have_symlink.inc;
+source include/not_windows.inc;
+
+if (!$ext) {
+  let ext=MYD;
+}
+
+create table t1 (a int, b char(16));
+insert t1 values (100, 'test');
+
+replace_result $MYSQLTEST_VARDIR MYSQLTEST_VARDIR;
+eval create table t2 (a int, b char(16))
+                      data directory="$MYSQLTEST_VARDIR/tmp";
+insert t2 values (200, 'some');
+select * from t2;
+flush tables;
+set debug_sync='mi_open_datafile WAIT_FOR go';
+send select * from t2;
+connect con1, localhost, root;
+let $datadir=`select @@datadir`;
+system ln -fs $datadir/test/t1.$ext $MYSQLTEST_VARDIR/tmp/t2.$ext;
+set debug_sync='now SIGNAL go';
+connection default;
+replace_result $MYSQLTEST_VARDIR MYSQLTEST_VARDIR;
+error 29;
+reap;
+flush tables;
+drop table t1, t2;
+set debug_sync='RESET';

@@ -313,12 +313,14 @@ MARIA_HA *maria_open(const char *name, int mode, uint open_flags)
                       goto err;
                     });
     if ((kfile=mysql_file_open(key_file_kfile, name_buff,
-                               (open_mode=O_RDWR) | O_SHARE,MYF(0))) < 0)
+                               (open_mode=O_RDWR) | O_SHARE | O_NOFOLLOW,
+                               MYF(0))) < 0)
     {
       if ((errno != EROFS && errno != EACCES) ||
 	  mode != O_RDONLY ||
 	  (kfile=mysql_file_open(key_file_kfile, name_buff,
-                                 (open_mode=O_RDONLY) | O_SHARE,MYF(0))) < 0)
+                                 (open_mode=O_RDONLY) | O_SHARE | O_NOFOLLOW,
+                                 MYF(0))) < 0)
 	goto err;
     }
     share->mode=open_mode;
@@ -1873,6 +1875,7 @@ int _ma_open_datafile(MARIA_HA *info, MARIA_SHARE *share, const char *org_name,
 {
   char *data_name= share->data_file_name.str;
   char real_data_name[FN_REFLEN];
+  int mode= share->mode | O_SHARE;
 
   if (org_name)
   {
@@ -1887,11 +1890,12 @@ int _ma_open_datafile(MARIA_HA *info, MARIA_SHARE *share, const char *org_name,
       }
       data_name= real_data_name;
     }
+    mode|= O_NOFOLLOW;
   }
 
+  DEBUG_SYNC_C("mi_open_datafile");
   info->dfile.file= share->bitmap.file.file=
-    mysql_file_open(key_file_dfile, data_name,
-                    share->mode | O_SHARE, MYF(MY_WME));
+    mysql_file_open(key_file_dfile, data_name, mode, MYF(MY_WME));
   return info->dfile.file >= 0 ? 0 : 1;
 }
 
@@ -1905,7 +1909,7 @@ int _ma_open_keyfile(MARIA_SHARE *share)
   mysql_mutex_lock(&share->intern_lock);
   share->kfile.file= mysql_file_open(key_file_kfile,
                                      share->unique_file_name.str,
-                                     share->mode | O_SHARE,
+                                     share->mode | O_SHARE | O_NOFOLLOW,
                              MYF(MY_WME));
   mysql_mutex_unlock(&share->intern_lock);
   return (share->kfile.file < 0);
