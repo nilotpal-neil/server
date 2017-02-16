@@ -591,7 +591,11 @@ struct srv_sys_t{
 	ulint		n_sys_threads;		/*!< size of the sys_threads
 						array */
 
-	srv_slot_t*	sys_threads;		/*!< server thread table */
+	srv_slot_t*	sys_threads;		/*!< server thread table;
+						os_event_set() and
+						os_event_reset() on
+						sys_threads[]->event are
+						covered by srv_sys_t::mutex */
 
 	ulint		n_threads_active[SRV_MASTER + 1];
 						/*!< number of threads active
