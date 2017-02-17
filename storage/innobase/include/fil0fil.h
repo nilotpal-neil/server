@@ -203,7 +203,9 @@ struct fil_node_t {
 	char*		name;
 	/** file handle (valid if is_open) */
 	os_file_t	handle;
-	/** event that groups and serializes calls to fsync */
+	/** event that groups and serializes calls to fsync;
+	os_event_set() and os_event_reset() are protected by
+	fil_system_t::mutex */
 	os_event_t	sync_event;
 	/** whether the file actually is a raw device or disk partition */
 	bool		is_raw_disk;
