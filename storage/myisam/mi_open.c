@@ -491,7 +491,7 @@ MI_INFO *mi_open(const char *name, int mode, uint open_flags)
       lock_error=1;			/* Database unlocked */
     }
 
-    if (mi_open_datafile(&info, share, name))
+    if (mi_open_datafile(&info, share))
       goto err;
     errpos=5;
 
@@ -572,7 +572,7 @@ MI_INFO *mi_open(const char *name, int mode, uint open_flags)
       my_errno=EACCES;				/* Can't open in write mode */
       goto err;
     }
-    if (mi_open_datafile(&info, share, name))
+    if (mi_open_datafile(&info, share))
       goto err;
     errpos=5;
     have_rtree= old_info->rtree_recursion_state != NULL;
@@ -1242,7 +1242,7 @@ We can't use dup() here as the data file descriptors need to have different
 active seek-positions.
 *************************************************************************/
 
-int mi_open_datafile(MI_INFO *info, MYISAM_SHARE *share, const char *org_name)
+int mi_open_datafile(MI_INFO *info, MYISAM_SHARE *share)
 {
   myf flags= MY_WME | (share->mode & O_NOFOLLOW ? MY_NOSYMLINKS: 0);
   DEBUG_SYNC_C("mi_open_datafile");
