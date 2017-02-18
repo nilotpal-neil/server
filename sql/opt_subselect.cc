@@ -1602,7 +1602,7 @@ static bool convert_subq_to_sj(JOIN *parent_join, Item_in_subselect *subq_pred)
 
   if (subq_pred->left_expr->cols() == 1)
   {
-    nested_join->sj_outer_expr_list.push_back(subq_pred->left_expr);
+    nested_join->sj_outer_expr_list.push_back(&subq_pred->left_expr);
     /*
       Create Item_func_eq. Note that
       1. this is done on the statement, not execution, arena
@@ -1624,7 +1624,7 @@ static bool convert_subq_to_sj(JOIN *parent_join, Item_in_subselect *subq_pred)
     for (uint i= 0; i < subq_pred->left_expr->cols(); i++)
     {
       nested_join->sj_outer_expr_list.push_back(subq_pred->left_expr->
-                                                element_index(i));
+                                                addr(i));
       Item_func_eq *item_eq= 
         new Item_func_eq(subq_pred->left_expr->element_index(i), 
                          subq_lex->ref_pointer_array[i]);
@@ -3181,8 +3181,8 @@ void restore_prev_sj_state(const table_map remaining_tables,
 ulonglong get_bound_sj_equalities(TABLE_LIST *sj_nest, 
                                   table_map remaining_tables)
 {
-  List_iterator<Item> li(sj_nest->nested_join->sj_outer_expr_list);
-  Item *item;
+  List_iterator<Item_ptr> li(sj_nest->nested_join->sj_outer_expr_list);
+  Item **item;
   uint i= 0;
   ulonglong res= 0;
   while ((item= li++))
@@ -3193,7 +3193,7 @@ ulonglong get_bound_sj_equalities(TABLE_LIST *sj_nest,
          class and see if there is an element that is bound?
       (this is an optional feature)
     */
-    if (!(item->used_tables() & remaining_tables))
+    if (!(item[0]->used_tables() & remaining_tables))
     {
       res |= 1ULL << i;
     }

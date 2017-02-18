@@ -4173,4 +4173,28 @@ Warnings:
 Note	1003	select `test`.`t1`.`id` AS `id`,`test`.`t1`.`c` AS `c` from `test`.`t1` where 0
 deallocate prepare stmt2;
 drop table t1;
+#
+# MDEV-9619: Assertion `null_ref_table' failed in virtual
+# table_map Item_direct_view_ref::used_tables() const on 2nd
+# execution of PS
+#
+CREATE TABLE t1 (f1 VARCHAR(10)) ENGINE=MyISAM;
+CREATE ALGORITHM=MERGE VIEW v1 AS SELECT * FROM t1;
+INSERT INTO t1 VALUES ('a'),('b');
+CREATE TABLE t2 (f2 VARCHAR(10)) ENGINE=MyISAM;
+INSERT INTO t2 VALUES ('c'),('d');
+PREPARE stmt FROM "SELECT * FROM v1 WHERE f1 = SOME ( SELECT f2 FROM t2 )";
+EXECUTE stmt;
+f1
+EXECUTE stmt;
+f1
+insert into t1 values ('c');
+EXECUTE stmt;
+f1
+c
+EXECUTE stmt;
+f1
+c
+drop view v1;
+drop table t1,t2;
 # End of 5.5 tests
