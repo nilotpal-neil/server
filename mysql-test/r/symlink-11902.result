@@ -1,16 +1,19 @@
-create table t1 (a int, b char(16));
-insert t1 values (100, 'test');
-create table t2 (a int, b char(16))
-data directory="MYSQLTEST_VARDIR/tmp";
-insert t2 values (200, 'some');
-select * from t2;
+call mtr.add_suppression("File.*t1.* not found");
+create table mysql.t1 (a int, b char(16));
+insert mysql.t1 values (100, 'test');
+create table t1 (a int, b char(16))
+data directory="MYSQLTEST_VARDIR/tmp/foo";
+insert t1 values (200, 'some');
+select * from t1;
 a	b
 200	some
 flush tables;
 set debug_sync='mi_open_datafile WAIT_FOR go';
-select * from t2;
+select * from t1;
 set debug_sync='now SIGNAL go';
-ERROR HY000: File 'MYSQLTEST_VARDIR/tmp/t2.MYD' not found (Errcode: 40)
+ERROR HY000: File 'MYSQLTEST_VARDIR/tmp/foo/t1.MYD' not found (Errcode: 20)
 flush tables;
-drop table t1, t2;
+drop table if exists mysql.t1, t1;
+Warnings:
+Warning	2	Can't find file: 't1' (errno: 2)
 set debug_sync='RESET';
