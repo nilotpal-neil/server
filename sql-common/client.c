@@ -3818,28 +3818,19 @@ static void mysql_close_free(MYSQL *mysql)
 */
 static void mysql_prune_stmt_list(MYSQL *mysql)
 {
-  LIST *pruned_list= 0;
-
-  while(mysql->stmts)
+  LIST *element= mysql->stmts;
+  for (; element; element= element->next)
   {
-    LIST *element= mysql->stmts;
     MYSQL_STMT *stmt= (MYSQL_STMT *) element->data;
-
-    mysql->stmts= list_delete(element, element);
     if (stmt->state != MYSQL_STMT_INIT_DONE)
     {
       stmt->mysql= 0;
       stmt->last_errno= CR_SERVER_LOST;
       strmov(stmt->last_error, ER(CR_SERVER_LOST));
       strmov(stmt->sqlstate, unknown_sqlstate);
-    }
-    else
-    {
-      pruned_list= list_add(pruned_list, element);
+      mysql->stmts= list_delete(mysql->stmts, element);
     }
   }
-
-  mysql->stmts= pruned_list;
 }
 
 
